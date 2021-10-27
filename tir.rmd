@@ -1,0 +1,240 @@
+# Time in range worksheet
+
+A brief, self-contained example of time in range and bootstrapping by patient
+ID.  This example does not yet contain a relative risk calculation.
+
+The example generates its own fake data for completeness. You may instead load
+CSV data and use that instead in the `range_plot` and `target_range` functions
+below.
+
+
+## Fake data
+
+Generate fake data for 100 patients as a  data frame with
+columns: `patient_id, date, hct`. The fake data is stored in the
+variable `hct_data` below.
+
+Alternatively, load your data from a CSV file.
+
+```{r}
+set.seed(1)
+# a function that makes up fake data for one patient
+patient <- function(...) {
+  eval_dates <- sort(sample(60, sample(2:10,1)) + as.Date("2020-1-1"))
+  patient_id <- paste(sample(10), collapse="")
+  hct <- 30.5 + rnorm(length(eval_dates), sd=3)
+  data.frame(patient_id = patient_id, date = eval_dates, hct = hct)
+}
+
+hct_data <- Reduce(rbind, Map(patient, seq(100)))
+```
+
+The fake data looks like:
+```{r}
+head(hct_data)
+```
+
+## Plot one patient's data
+
+The `range_plot` function plots data for one patient from the patient data frame.
+You must specify:
+
+- `id`  The patient ID to plot.
+- `data` The data frame variable with the patient data (e.g., `hct_data` above).
+- `id_field` The name of the data column with the patient ID.
+- `low` Target range lower boundary.
+- `high` Target range upper boundary.
+- `interp_limit` Maximum time (in days) to linearly interpolate measurements.
+- `carry_forward` Time (in days) to carry forward a last measured value. `carry_forward` must be less than `interp_limit`.
+
+```{r}
+range_plot <- function(id, data, id_field, low, high, interp_limit, carry_forward) {
+  i <- data[[id_field]] == id
+  dates <- data[["date"]][i]
+  vals <- data[["hct"]][i]
+  ylim <- range(c(vals, low * 0.85, high * 1.15))
+  plot.new()
+  plot.window(xlim = range(c(dates, max(dates) + carry_forward)), ylim = ylim)
+  points(dates, vals, pch="x", cex=1.5)
+  dt <- c(0, as.integer(diff(dates)))
+  # add linear interpolants
+  j <- which(dt < interp_limit)[-1]
+  for(k in j) lines(x=c(dates[k-1], dates[k]), y=c(vals[k-1], vals[k]), col=4, lwd=3)
+  # add carry forward
+  j <- c(which(dt >= interp_limit) - 1, length(dates))
+  for(k in j) lines(x=c(dates[k], dates[k] + carry_forward), y=c(vals[k], vals[k]), col=7, lwd=3)
+  abline(h=low, lwd=2, lty=2)
+  abline(h=high, lwd=2, lty=2)
+  axis(1, labels = as.character(dates), at = dates)
+  axis(2)
+  box()
+  title(xlab = "Date")
+  title(ylab = "Hct")
+  title(main = paste("ID", id))
+}
+```
+
+Here is an example using the fake `hct_data`:
+
+```{r}
+range_plot("94871510263", hct_data, "patient_id", low=29, high=32, interp_limit=7, carry_forward=7)
+```
+
+## Time in Range computation
+
+The following rather complicated function records the time spent above, within,
+and below the target range for a given single patient ID, subject to the
+specified interpolation and carry forward values. It returns a data frame
+with (patient) id, time, and range values.
+
+The function arguments are identical to the plot function above:
+
+- `id`  The patient ID to plot.
+- `data` The data frame variable with the patient data (e.g., `hct_data` above).
+- `id_field` The name of the data column with the patient ID.
+- `low` Target range lower boundary.
+- `high` Target range upper boundary.
+- `interp_limit` Maximum time (in days) to linearly interpolate measurements.
+- `carry_forward` Time (in days) to carry forward a last measured value. `carry_forward` must be less than `interp_limit`.
+
+
+This function is a bit complicated and can probably be simplified. There is
+nothing advanced within, it's all very simple. Just a bit long...
+
+```{r}
+target_range = function(id, data, id_field, low, high, interp_limit, carry_forward) {
+  if(carry_forward < interp_limit) stop("carry_forward must be >= interp_limit")
+  i <- data[[id_field]] == id
+  dates <- data[["date"]][i]
+  vals <- data[["hct"]][i]
+  k <- order(dates)
+  dates <- dates[k]
+  vals <- vals[k]
+  # add linear interpolant points outside of target range
+  dt <- c(0, as.numeric(diff(dates)))
+  j <- which(dt < interp_limit)[-1]
+  j <- j[(vals[j-1]  < low & low <= vals[j]) | (high < vals[j-1] & vals[j] <= high)]
+  if(length(j) > 0) {
+    m <- (vals[j] - vals[j-1]) / dt[j] 
+    y <- low * (vals[j-1] < low) + high * (high < vals[j-1])
+    x <- (y - vals[j]) / m + dates[j]
+    dates <- c(dates, x)
+    vals <- c(vals, y)
+    k <- order(dates)
+    dates <- dates[k]
+    vals <- vals[k]
+  }
+  # Add remaining interpolated crossings (if any)...
+  dt <- c(0, as.numeric(diff(dates)))
+  j <- which(dt < interp_limit)[-1]
+  j <- j[(low <= vals[j-1] & vals[j-1] <= high & vals[j] < low) | (low <= vals[j-1] & vals[j-1] <= high & high < vals[j])]
+  if(length(j) > 0) {
+    m <- (vals[j] - vals[j-1]) / dt[j] 
+    y <- low * (vals[j] < low) + high * (high < vals[j])
+    x <- (y - vals[j]) / m + dates[j]
+    dates <- c(dates, x)
+    vals <- c(vals, y)
+    k <- order(dates)
+    dates <- dates[k]
+    vals <- vals[k]
+  }
+
+  # Add up times below, target, and above target range
+  dt <- c(0, as.numeric(diff(dates)))
+  j <- which(dt < interp_limit)[-1]
+  r <- c("above", "target", "below")[
+             1 * (vals[j] > high | vals[j-1] > high) +
+             2 * (low <= vals[j] & vals[j] <= high & low <= vals[j-1] & vals[j-1] <= high) +
+             3 *(vals[j-1] < low | vals[j] < low) ]
+  
+  ans <- if(length(j) > 0) {
+           data.frame(id = id, days = dt[j], range = r)
+         } else {
+           data.frame()
+         }
+
+  # Add in piecewise-constant interpolated times (carry-forward times)
+  # and missing time
+  j <- unique(c(which(dt >= interp_limit)-1, length(dates)))
+  y <- c("above", "target", "below") [
+             1 * (vals[j] > high) +
+             2 * (low <= vals[j] & vals[j] <= high) +
+             3 *(vals[j] < low) ]
+  total_missing <- as.numeric(max(dates) + carry_forward - min(dates)) - sum(ans[["days"]]) - carry_forward * length(y)
+  rbind(ans, data.frame(id = id, days = carry_forward, range = y), data.frame(id = id, days = total_missing, range = "missing"))
+}
+```
+
+Here is an example time in range computation using the fake `hct_data` data for one patient
+ID:
+
+```{r}
+target_range("94871510263", hct_data, "patient_id", low=29, high=32, interp_limit=7, carry_forward=7)
+```
+
+
+## Compite time in range for all patient IDs
+
+Simply Map the `target_range` function across all the data, again using the fake `hct_data`
+above. We combine the data frame result for each patient using `rbind` and `Reduce` into
+a single data frame:
+
+```{r}
+ranges <- Reduce(rbind,
+            Map(function(i) target_range(i, hct_data, "patient_id", low=29, high=32, interp_limit=7, carry_forward=7),
+                unique(hct_data[["patient_id"]])))
+```
+
+Now, aggregate all time in each range for all data:
+
+```{r}
+tir <- aggregate(list(total_time = ranges[["days"]]), by=list(range=ranges[["range"]]), FUN=sum)
+tir[["percent"]] = tir$total_time / sum(ranges[["days"]])
+
+tir
+```
+
+## Bootstrap across patient IDs
+
+The above time in range computation shows the breakdown for all patients. We can get a sense
+of variability in the patient population by bootstrapping across patients. The bootstrap
+code below samples across blocks of *patient IDs* with replacement.
+
+```{r}
+N <- 1000  # Number of bootstraps
+tir_bootstrapped <- Reduce(rbind, replicate(N, {
+  i <- ranges[["id"]] %in% sample(unique(ranges[["id"]]), replace = TRUE)
+  tir <- aggregate(list(total_time = ranges[["days"]][i]), by=list(range=ranges[["range"]][i]), FUN=sum)
+  tir[["percent"]] = tir$total_time / sum(ranges[["days"]][i])
+  tir
+}, simplify=FALSE))
+```
+
+Some statistics on the bootstrapped per cent time within each range are computed below. When
+the number of bootstraps `N` is large enough, the mean per cent times closely match the
+total per cent times (shown above in the `tir` variable):
+
+```{r}
+aggregate(list(mean_percent_time = tir_bootstrapped[["percent"]]), by=list(range = tir_bootstrapped[["range"]]), FUN=mean)
+```
+
+And the standard deviations...
+```{r}
+aggregate(list(sd_percent_time = tir_bootstrapped[["percent"]]), by=list(range = tir_bootstrapped[["range"]]), FUN=sd)
+```
+
+Of course, for standard deviations to make sense we should confirm that the bootstrapped values
+look approximately Gaussian. The following example plots a smoothed histogram for the bootstrapped
+values for values in the target range.
+
+```{r}
+d <- aggregate(list(density = tir_bootstrapped[["percent"]]), by=list(range = tir_bootstrapped[["range"]]), FUN=density)
+i <-  which(d[["range"]] == "target")
+
+plot(d[i,"density"][1,]$x, d[i,"density"][1,]$y, type="l", lwd=2, col=4,
+     main="Target range density", xlab="per cent time in range", ylab="density")
+```
+
+This plot uses fake data, and so it looks pretty good. Deviations from a bell curve here
+might indicate problematic data, or not enough data.
+
